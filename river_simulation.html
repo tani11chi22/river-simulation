@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>川の流速と土砂の運搬シミュレーション</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, "ヒラギノ角ゴ ProN", "メイリオ", "Noto Sans JP", sans-serif; margin: 12px; background: #eef7ff; color:#0b3a66; }
+    h1 { font-size: 1.4rem; margin: 0 0 8px 0; }
+    #container { display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap; }
+    #canvas-wrap { background:linear-gradient(#bfe6ff,#eaf6ff); border:2px solid #89c2ff; border-radius:8px; padding:8px; }
+    canvas { display:block; border-radius:6px; background: linear-gradient(#dff3ff,#ffffff 60%); }
+    .controls { max-width:320px; }
+    label { display:block; margin-top:8px; }
+    input[type=range] { width:100%; }
+    .small { font-size:0.85rem; color:#155; }
+    button { margin-top:8px; padding:6px 10px; border-radius:6px; border:1px solid #0b5; background: #cfffd6; cursor:pointer;}
+    .footer { margin-top:10px; font-size:0.9rem; color:#084; }
+  </style>
+
+  <!-- Brython 本体を読み込む -->
+  <script src="https://cdn.jsdelivr.net/npm/brython@3.9.5/brython.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/brython@3.9.5/brython_stdlib.js"></script>
+</head>
+<body onload="brython()">
+  <h1>川の流速で土砂がどう変わるか 見てみよう！</h1>
+  <div id="container">
+    <div id="canvas-wrap">
+      <canvas id="river" width="740" height="320"></canvas>
+      <div class="small">青いところが水、下の茶色いところが川底（かわぞこ）です。</div>
+    </div>
+
+    <div class="controls">
+      <label>流速（りゅうそく）: <span id="speed-val">1.0</span> m/s</label>
+      <input id="speed" type="range" min="0" max="3.0" step="0.05" value="1.0">
+
+      <label>しゅんかん（土砂がはね上がる量の強さ）: <span id="lift-val">1.0</span></label>
+      <input id="lift" type="range" min="0.2" max="2.0" step="0.1" value="1.0">
+
+      <label>時間の速さ（アニメの速さ）: <span id="time-val">1.0</span></label>
+      <input id="timescale" type="range" min="0.25" max="3.0" step="0.25" value="1.0">
+
+      <button id="startstop">ストップ</button>
+      <button id="reset">リセット</button>
+
+      <div class="footer">
+        <strong>説明（やさしく）</strong>
+        <ul>
+          <li>流れが速いと、川はたくさんの土砂を運びます。</li>
+          <li>流れが遅いと、土砂は落ちて川底にたまります。</li>
+          <li>スライダーで流速を変えて、砂や小石の動きを見てね。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Python（Brython）で書かれたシミュレーション -->
+  <script type="text/python">
+from browser import document, html, timer
+import random, math, time
+
+canvas = document["river"]
+ctx = canvas.getContext("2d")
+
+# 設定
+W = canvas.width
+H = canvas.height
+bed_top = int(H * 0.75)   # 川底の上の境目
+particles = []            # 土砂の粒リスト
+
+# UI要素
+speed_input = document["speed"]
+lift_input = document["lift"]
+timescale_input = document["timescale"]
+speed_val = document["speed-val"]
+lift_val = document["lift-val"]
+time_val = document["time-val"]
+startstop_btn = document["startstop"]
+reset_btn = document["reset"]
+
+running = True
+
+def update_ui():
+    speed_val.text = float(speed_input.value)
+    lift_val.text = float(lift_input.value)
+    time_val.text = float(timescale_input.value)
+
+update_ui()
+
+# パーティクル（粒）を作る
+def spawn_particle():
+    # 川底付近からランダムに出る（xは左の下流へ流れる）
+    x = random.uniform(0, W)
+    y = random.uniform(bed_top - 6, bed_top + 2)
+    size = random.uniform(1.5, 4.0)
+    # 初期の横向き速度は小さめ（後で流速で増える）
+    vx = random.uniform(0.2, 0.6)
+    vy = random.uniform(-1.0, -0.3)  # 少しはねる
+    color = "#8b5a2b" if random.random() < 0.7 else "#bda27e"
+    age = 0
+    return {"x":x, "y":y, "vx":vx, "vy":vy, "size":size, "color":color, "age":age}
+
+# 土砂の運搬量の簡単なモデル（わかりやすく）
+# しきい値より速い流速のぶんだけ「たくさん運ぶ」として、2乗で増えるイメージ
+def transport_rate(flow_speed, lift_factor):
+    threshold = 0.4  # この速さ以下だと、あまり運ばれないイメージ
+    if flow_speed <= threshold:
+        return 0.0
+    # シンプルな式：k * (flow_speed - threshold)^2 * lift_factor
+    k = 0.9
+    return k * (flow_speed - threshold)**2 * lift_factor
+
+last_time = time.time()
+
+def step():
+    global last_time, particles
+    now = time.time()
+    dt = now - last_time
+    last_time = now
+    # UIから値を取得
+    flow_speed = float(speed_input.value)      # m/s のイメージ
+    lift_factor = float(lift_input.value)
+    timescale = float(timescale_input.value)
+
+    # UI 表示
+    update_ui()
+
+    # どれくらい新しい粒を出すか決める（運搬量に比例）
+    rate = transport_rate(flow_speed, lift_factor)
+    # rate をそのまま「1秒あたりの新粒子数」として使う（わかりやすく）
+    to_spawn = int(rate * dt * 10 * timescale)  # 調整係数で見やすく
+    for _ in range(max(0, to_spawn)):
+        particles.append(spawn_particle())
+
+    # パーティクルの更新
+    new_particles = []
+    for p in particles:
+        # 流れに引っ張られる：横速度に流速成分を足す（流れの強さで早くなる）
+        # 川の中では、上の方ほど速く下の方は遅いイメージ（簡易）
+        depth_factor = 1.0 - max(0.0, (p["y"] - bed_top)) / (H - bed_top + 0.0001)
+        p["vx"] += (flow_speed * 0.2 * depth_factor) * dt * timescale
+        # 重力と水の抵抗で下へ戻る力
+        p["vy"] += 9.8 * 0.02 * dt * (1.0 - depth_factor)  # 簡単な重力イメージ
+        # 空気中で止まるように摩擦
+        p["vx"] *= 0.999
+        p["vy"] *= 0.995
+
+        # 位置更新
+        p["x"] += p["vx"] * 60 * dt * timescale
+        p["y"] += p["vy"] * 60 * dt * timescale
+
+        p["age"] += dt
+
+        # 川の上に出たら、だんだん落ちる（重力で川底へ）
+        if p["y"] > bed_top + 6:
+            # 川底に近ければ速度を弱めて止まりやすくする（堆積）
+            p["vx"] *= 0.6
+            p["vy"] = 0
+            # 長く居すぎたら消える（たまる）
+            if p["age"] > 4.0 + random.random() * 6.0:
+                continue  # 消す（川底にたまった）
+        # 画面外（右）に出たら消す（下流へ運ばれた）
+        if p["x"] > W + 20 or p["x"] < -20 or p["y"] < -50 or p["y"] > H + 30:
+            continue
+        new_particles.append(p)
+
+    particles = new_particles
+
+    # 描画
+    ctx.clearRect(0, 0, W, H)
+
+    # 空と水の描画（簡単）
+    # 空のグラデーションは canvas の背景でやってあるのでここでは水だけ
+    ctx.fillStyle = "rgba(20,120,200,0.10)"
+    ctx.fillRect(0, 0, W, bed_top)
+
+    # 流れ線（速さに応じて本数をかえる）
+    num_lines = 5 + int(flow_speed * 4)
+    for i in range(num_lines):
+        y = int(bed_top * 0.2 + (bed_top * 0.6) * (i / float(num_lines)))
+        ctx.beginPath()
+        ctx.moveTo(0, y + math.sin(now*2 + i) * 3)
+        ctx.quadraticCurveTo(W*0.5, y + math.cos(now*1.5 + i) * 5, W, y + math.sin(now*0.9 + i) * 3)
+        ctx.lineWidth = 1
+        ctx.strokeStyle = "rgba(20,100,170,0.08)"
+        ctx.stroke()
+
+    # 川底（茶色い土）
+    ctx.fillStyle = "#d3b58b"
+    ctx.fillRect(0, bed_top, W, H-bed_top)
+
+    # 川底の小石など（ランダムな点）
+    for i in range(30):
+        xi = (i * 37) % W
+        yi = bed_top + 4 + ((i*17) % 8)
+        ctx.beginPath()
+        ctx.arc(xi, yi, 1.2, 0, 2*math.pi)
+        ctx.fillStyle = "#b08857"
+        ctx.fill()
+
+    # 粒の描画
+    for p in particles:
+        ctx.beginPath()
+        ctx.arc(p["x"], p["y"], p["size"], 0, 2*math.pi)
+        # 速度が速いほど明るく（はこぶ量が多いと目立つ）
+        speed = math.hypot(p["vx"], p["vy"])
+        alpha = min(1.0, 0.3 + speed*0.2)
+        # 色を透明度で変える
+        base = p["color"]
+        ctx.fillStyle = base
+        # 少し影をつける
+        ctx.globalAlpha = alpha
+        ctx.fill()
+        ctx.globalAlpha = 1.0
+
+    # 右上に簡単なグラフ情報（運搬量の目安）
+    ctx.fillStyle = "#053"
+    ctx.font = "14px sans-serif"
+    info = f"推定運搬量（目安）: {transport_rate(flow_speed, lift_factor):.2f}"
+    ctx.fillText(info, 8, 18)
+
+# タイマーで動かす（約30fps）
+def tick():
+    if running:
+        step()
+
+interval_id = timer.set_interval(tick, 33)
+
+# ボタン動作
+def toggle(ev):
+    global running
+    running = not running
+    startstop_btn.text = "スタート" if not running else "ストップ"
+startstop_btn.bind("click", toggle)
+
+def do_reset(ev):
+    global particles
+    particles = []
+reset_btn.bind("click", do_reset)
+
+# スライダーが動いたら即反映
+for el in (speed_input, lift_input, timescale_input):
+    el.bind("input", lambda ev: update_ui())
+
+  </script>
+</body>
+</html>
